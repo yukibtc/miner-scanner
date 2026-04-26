@@ -1,0 +1,20 @@
+[package]
+name = "miner-scanner"
+version = "0.1.0"
+edition = "2024"
+description = "Async library to scan a LAN and detect common Bitcoin miner."
+authors = ["Yuki Kishimoto <yukikishimoto@protonmail.com>"]
+homepage = "https://github.com/shadowylab/miner-scanner"
+repository = "https://github.com/shadowylab/miner-scanner.git"
+license = "MIT"
+readme = "README.md"
+rust-version = "1.85.0"
+keywords = ["bitcoin", "miner", "async", "network", "tokio"]
+
+[dependencies]
+futures-util = "0.3"
+ipnet = "2.12"
+tokio = { version = "1", features = ["io-util", "net", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
