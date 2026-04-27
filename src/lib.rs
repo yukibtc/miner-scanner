@@ -58,7 +58,7 @@ impl Default for ScanOptions {
 pub fn scan_network(
     cidr: IpNet,
     opts: ScanOptions,
-) -> Pin<Box<dyn Stream<Item = DiscoveredMiner> + Send>> {
+) -> Pin<Box<dyn Stream<Item = DiscoveredMiner> + Send + Sync>> {
     Box::pin(
         stream::iter(cidr.hosts())
             .map(move |ip| async move { scan_host(ip, opts).await })
