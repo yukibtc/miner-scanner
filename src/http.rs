@@ -17,6 +17,8 @@ const PROBE_HTTP_ENDPOINTS: [&str; 4] = [
 struct HttpBody {
     body: String,
     keep_alive: bool,
+    status_code: u16,
+    www_authenticate: Option<String>,
 }
 
 impl HttpBody {
@@ -71,6 +73,8 @@ impl HttpBody {
             return Some(Self {
                 body: String::from_utf8_lossy(&body).into_owned(),
                 keep_alive: head.keep_alive,
+                status_code: head.status_code,
+                www_authenticate: head.www_authenticate,
             });
         }
 
@@ -82,6 +86,8 @@ impl HttpBody {
             return Some(Self {
                 body: String::from_utf8_lossy(&decoded).into_owned(),
                 keep_alive: head.keep_alive,
+                status_code: head.status_code,
+                www_authenticate: head.www_authenticate,
             });
         }
 
@@ -98,15 +104,19 @@ impl HttpBody {
         Some(Self {
             body: String::from_utf8_lossy(&body).into_owned(),
             keep_alive: false,
+            status_code: head.status_code,
+            www_authenticate: head.www_authenticate,
         })
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct HttpResponseHead {
     content_length: Option<usize>,
     chunked: bool,
     keep_alive: bool,
+    status_code: u16,
+    www_authenticate: Option<String>,
 }
 
 impl HttpResponseHead {
@@ -123,10 +133,13 @@ impl HttpResponseHead {
             return None;
         }
 
+        let status_code: u16 = status_line.split_ascii_whitespace().nth(1)?.parse().ok()?;
+
         let mut connection_close: bool = http10;
         let mut connection_keep_alive: bool = false;
         let mut content_length = None;
         let mut chunked: bool = false;
+        let mut www_authenticate: Option<String> = None;
 
         for line in lines {
             let Some((name, value)) = line.split_once(':') else {
@@ -154,6 +167,19 @@ impl HttpResponseHead {
                 connection_keep_alive = value
                     .split(',')
                     .any(|part| part.trim().eq_ignore_ascii_case("keep-alive"));
+                continue;
+            }
+
+            if name.eq_ignore_ascii_case("WWW-Authenticate") {
+                match &mut www_authenticate {
+                    Some(existing) => {
+                        existing.push_str(", ");
+                        existing.push_str(value);
+                    }
+                    None => {
+                        www_authenticate = Some(value.to_string());
+                    }
+                }
             }
         }
 
@@ -167,6 +193,8 @@ impl HttpResponseHead {
             content_length,
             chunked,
             keep_alive,
+            status_code,
+            www_authenticate,
         })
     }
 }
@@ -234,12 +262,86 @@ pub(crate) async fn probe(ip: IpAddr, opts: ScanOptions) -> Option<DiscoveredMin
             continue;
         };
 
+        if let Some(detection) = classify_antminer_auth_challenge(
+            addr,
+            endpoint,
+            response.status_code,
+            response.www_authenticate.as_deref(),
+        ) {
+            return Some(detection);
+        }
+
         if let Some(detection) = classify_http_payload(addr, endpoint, response.body) {
             return Some(detection);
         }
 
         if !response.keep_alive {
             break;
+        }
+    }
+
+    None
+}
+
+fn classify_antminer_auth_challenge(
+    addr: SocketAddr,
+    endpoint: &str,
+    status_code: u16,
+    www_authenticate: Option<&str>,
+) -> Option<DiscoveredMiner> {
+    if status_code != 401 {
+        return None;
+    }
+
+    let realm: &str = auth_realm(www_authenticate?)?;
+    let normalized: String = realm.to_ascii_lowercase();
+
+    if normalized != "antminer" && !normalized.starts_with("antminer ") {
+        return None;
+    }
+
+    Some(DiscoveredMiner {
+        addr,
+        family: crate::MinerFamily::Antminer,
+        confidence: 90,
+        evidence: vec![
+            format!("source=http{endpoint}"),
+            String::from("status=401"),
+            String::from("match=antminer-auth-realm"),
+            format!("auth-realm={realm}"),
+        ],
+    })
+}
+
+fn auth_realm(challenge: &str) -> Option<&str> {
+    for parameter in challenge.split(',') {
+        let lower: String = parameter.to_ascii_lowercase();
+        let Some(realm_start) = lower.find("realm") else {
+            continue;
+        };
+
+        if realm_start > 0 && !lower.as_bytes()[realm_start - 1].is_ascii_whitespace() {
+            continue;
+        }
+
+        let Some(value) = parameter[realm_start + "realm".len()..]
+            .trim_start()
+            .strip_prefix('=')
+            .map(str::trim_start)
+        else {
+            continue;
+        };
+
+        if let Some(quoted) = value.strip_prefix('"') {
+            if let Some((realm, _)) = quoted.split_once('"') {
+                return Some(realm);
+            }
+
+            continue;
+        }
+
+        if let Some(realm) = value.split_ascii_whitespace().next() {
+            return Some(realm);
         }
     }
 
@@ -382,6 +484,64 @@ mod tests {
         assert_eq!(head.content_length, Some(4));
         assert!(!head.chunked);
         assert!(head.keep_alive);
+        assert_eq!(head.status_code, 200);
+        assert_eq!(head.www_authenticate, None);
+    }
+
+    #[test]
+    fn parse_http_response_head_extracts_auth_challenge() {
+        let headers = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nWWW-Authenticate: Digest realm=\"antMiner Configuration\", nonce=\"abc\"\r\n\r\n";
+        let head = HttpResponseHead::parse(headers).expect("expected HTTP head");
+
+        assert_eq!(head.status_code, 401);
+        assert_eq!(
+            head.www_authenticate.as_deref(),
+            Some("Digest realm=\"antMiner Configuration\", nonce=\"abc\"")
+        );
+    }
+
+    #[test]
+    fn classify_antminer_auth_realm() {
+        let detected = classify_antminer_auth_challenge(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 102)), 80),
+            "/",
+            401,
+            Some("Digest realm=\"antMiner Configuration\", nonce=\"abc\""),
+        )
+        .expect("expected antminer detection");
+
+        assert_eq!(detected.family, MinerFamily::Antminer);
+        assert_eq!(detected.confidence, 90);
+        assert!(
+            detected
+                .evidence
+                .iter()
+                .any(|item| item == "auth-realm=antMiner Configuration")
+        );
+    }
+
+    #[test]
+    fn reject_generic_auth_realm() {
+        let detected = classify_antminer_auth_challenge(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 103)), 80),
+            "/",
+            401,
+            Some("Basic realm=\"Administration\""),
+        );
+
+        assert!(detected.is_none());
+    }
+
+    #[test]
+    fn reject_antminer_realm_without_auth_challenge() {
+        let detected = classify_antminer_auth_challenge(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 104)), 80),
+            "/",
+            200,
+            Some("Digest realm=\"antMiner Configuration\""),
+        );
+
+        assert!(detected.is_none());
     }
 
     #[test]
